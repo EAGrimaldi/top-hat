@@ -15,22 +15,10 @@ var (
 	GuildID        = flag.String("guild", "", "Test guild ID. If not passed - bot registers commands globally")
 	SkronkID       = flag.String("skronk", "", "Skronk role ID. If not passed - bot searches for role by name")
 	BotToken       = flag.String("token", "", "Bot access token")
-	RemoveCommands = flag.Bool("rmcmd", true, "Remove all commands after shutdowning or not")
-)
+	RemoveCommands = flag.Bool("rmcmd", true, "Remove all commands after shutting down or not")
 
-var s *discordgo.Session
+	s *discordgo.Session
 
-func init() { flag.Parse() }
-
-func init() {
-	var err error
-	s, err = discordgo.New("Bot " + *BotToken)
-	if err != nil {
-		log.Fatalf("Invalid bot parameters: %v", err)
-	}
-}
-
-var (
 	durationMinValue = 10.0
 
 	commands = []*discordgo.ApplicationCommand{
@@ -41,13 +29,13 @@ var (
 				{
 					Type:        discordgo.ApplicationCommandOptionUser,
 					Name:        "target",
-					Description: "who are you skronk'ing?",
+					Description: "Who will you skronk?",
 					Required:    true,
 				},
 				{
 					Type:        discordgo.ApplicationCommandOptionInteger,
 					Name:        "duration",
-					Description: "how long are they skronk'd for? (in seconds)",
+					Description: "How long will you skronk them for? (in seconds)",
 					MinValue:    &durationMinValue,
 					MaxValue:    60.0 * 60.0 * 24.0 * 7.0,
 					Required:    false,
@@ -58,9 +46,35 @@ var (
 
 	commandHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
 		"skronk": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-			// TODO:
-			// - find "SKRONK'd" role if roleID not provided
-			// - blacklist SKRONK'd users from bot commands
+			/* TODO:
+			- track cumulative SKRONK'd duration when multiple /skronk commands on the same use overlap
+			*/
+
+			// pass command if skronk role not provided
+			if len(*SkronkID) == 0 {
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: "Command unavailable: skronk role not provided",
+					},
+				})
+				return
+			}
+
+			// pass command if sender is skronk'd
+			for _, role := range i.Member.Roles {
+				if role == *SkronkID {
+					s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+						Type: discordgo.InteractionResponseChannelMessageWithSource,
+						Data: &discordgo.InteractionResponseData{
+							Content: "The skronk'd cannot skronk others >:(",
+						},
+					})
+					return
+				}
+			}
+
+			// get command options
 			options := i.ApplicationCommandData().Options
 			optionMap := make(map[string]*discordgo.ApplicationCommandInteractionDataOption, len(options))
 			for _, opt := range options {
@@ -73,29 +87,29 @@ var (
 			var duration int64 = int64(durationMinValue)
 
 			if opt, ok := optionMap["target"]; ok {
-				if opt.UserValue(nil).ID == s.State.User.ID {
+				targetID = opt.UserValue(nil).ID
+				if targetID == s.State.User.ID {
 					targetID = i.Member.User.ID
-					msgformat += "skronk me? skronk ME!? skronk YOURSELF!!!"
-				} else {
-					targetID = opt.UserValue(nil).ID
+					msgformat += "Skronk me? Skronk ME!? Skronk YOURSELF!!!\n"
 				}
-			} else {
-				targetID = i.Member.User.ID
-				msgformat += "how did you fuck that up?"
 			}
 			margs = append(margs, targetID)
-			msgformat += "get skronk'd <@%s>\n"
+			msgformat += "Get skronk'd <@%s>\n"
 
 			if opt, ok := optionMap["duration"]; ok {
 				duration = opt.IntValue()
 			}
 			margs = append(margs, duration)
-			msgformat += "see you in %d seconds!\n"
+			msgformat += "See you in %d seconds!\n"
 
+			// add skronk role to target - handle possible error (usually role hierarchy issue)
 			err := s.GuildMemberRoleAdd(*GuildID, targetID, *SkronkID)
-			if err != nil {
-				s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-					Content: "Something went wrong while adding a role",
+			if err != nil { // probably a permission or hierarchy issue
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: "Something went wrong while adding a role",
+					},
 				})
 				fmt.Println(err)
 				return
@@ -109,11 +123,16 @@ var (
 					),
 				},
 			})
+
+			// wait duration and remove skronk role from target
 			time.AfterFunc(time.Second*time.Duration(duration), func() {
 				err := s.GuildMemberRoleRemove(*GuildID, targetID, *SkronkID)
-				if err != nil {
-					s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-						Content: "Something went wrong while removing a role",
+				if err != nil { // probably a permission or hierarchy issue
+					s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+						Type: discordgo.InteractionResponseChannelMessageWithSource,
+						Data: &discordgo.InteractionResponseData{
+							Content: "Something went wrong while removing a role",
+						},
 					})
 					fmt.Println(err)
 					return
@@ -122,7 +141,7 @@ var (
 					Type: discordgo.InteractionResponseChannelMessageWithSource,
 					Data: &discordgo.InteractionResponseData{
 						Content: fmt.Sprintf(
-							"welcome back <@%s>!",
+							"Welcome back <@%s>!",
 							targetID,
 						),
 					},
@@ -133,6 +152,33 @@ var (
 )
 
 func init() {
+	flag.Parse()
+
+	var err error
+	s, err = discordgo.New("Bot " + *BotToken)
+	if err != nil {
+		log.Fatalf("Invalid bot parameters: %v", err)
+	}
+
+	// find skronk role by name if role ID not provided at start up
+	if len(*SkronkID) == 0 {
+		log.Println("Skronk role ID was not provided, searching for skronk role by name")
+		roles, err := s.GuildRoles(*GuildID)
+		if err != nil {
+			log.Fatalf("Invalid guild parameters: %v", err)
+		}
+		for _, role := range roles {
+			if role.Name == "SKRONK'd" {
+				*SkronkID = role.ID
+			}
+		}
+		if len(*SkronkID) == 0 {
+			log.Println("Skronk role was not found, skronk command will be unavailable")
+		} else {
+			log.Printf("Skronk role found. Skronk role ID is %s\nWRITE THAT DOWN!", *SkronkID)
+		}
+	}
+
 	s.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if h, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
 			h(s, i)
