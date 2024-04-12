@@ -6,10 +6,21 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
+
+type SharedDurationMap struct {
+	mu   sync.RWMutex
+	data map[string]int64
+}
+
+type SharedFlagMap struct {
+	mu    sync.RWMutex
+	flags map[string]bool
+}
 
 var (
 	GuildID        = flag.String("guild", "", "Test guild ID. If not passed - bot registers commands globally")
@@ -20,6 +31,9 @@ var (
 	s *discordgo.Session
 
 	durationMinValue = 10.0
+
+	skronkTotalDuration = new(SharedDurationMap)
+	skronkInProgress    = new(SharedFlagMap)
 
 	commands = []*discordgo.ApplicationCommand{
 		{
@@ -46,10 +60,6 @@ var (
 
 	commandHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
 		"skronk": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-			/* TODO:
-			- track cumulative SKRONK'd duration when multiple /skronk commands on the same use overlap
-			*/
-
 			// pass command if skronk role not provided
 			if len(*SkronkID) == 0 {
 				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -102,7 +112,7 @@ var (
 			margs = append(margs, duration)
 			msgformat += "See you in %d seconds!\n"
 
-			// add skronk role to target - handle possible error (usually role hierarchy issue)
+			// add skronk role to target
 			err := s.GuildMemberRoleAdd(*GuildID, targetID, *SkronkID)
 			if err != nil { // probably a permission or hierarchy issue
 				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -124,29 +134,60 @@ var (
 				},
 			})
 
-			// wait duration and remove skronk role from target
-			time.AfterFunc(time.Second*time.Duration(duration), func() {
-				err := s.GuildMemberRoleRemove(*GuildID, targetID, *SkronkID)
-				if err != nil { // probably a permission or hierarchy issue
-					s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-						Type: discordgo.InteractionResponseChannelMessageWithSource,
-						Data: &discordgo.InteractionResponseData{
-							Content: "Something went wrong while removing a role",
-						},
-					})
-					fmt.Println(err)
-					return
+			// track total duration in shared resource
+			skronkTotalDuration.mu.Lock()
+			skronkTotalDuration.data[targetID] += duration
+			fmt.Printf("/skronk'd <@%s> for %d seconds\n", targetID, duration)
+			fmt.Printf("\t(%d seconds total this instance)\n", skronkTotalDuration.data[targetID])
+			skronkTotalDuration.mu.Unlock()
+
+			// only one goroutine handles timing per user
+			skronkInProgress.mu.Lock()
+			if skronkInProgress.flags[targetID] {
+				skronkInProgress.mu.Unlock()
+				return
+			}
+			skronkInProgress.flags[targetID] = true
+			skronkInProgress.mu.Unlock()
+
+			for {
+				time.Sleep(time.Second * time.Duration(duration))
+				skronkTotalDuration.mu.Lock()
+				skronkTotalDuration.data[targetID] -= duration
+				duration = skronkTotalDuration.data[targetID]
+				if skronkTotalDuration.data[targetID] <= 0 {
+					skronkTotalDuration.mu.Unlock()
+					break
 				}
+				skronkTotalDuration.mu.Unlock()
+			}
+
+			skronkInProgress.mu.Lock()
+			skronkInProgress.flags[targetID] = false
+			skronkInProgress.mu.Unlock()
+
+			// remove skronk role from target
+			err = s.GuildMemberRoleRemove(*GuildID, targetID, *SkronkID)
+			if err != nil { // probably a permission or hierarchy issue
 				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 					Type: discordgo.InteractionResponseChannelMessageWithSource,
 					Data: &discordgo.InteractionResponseData{
-						Content: fmt.Sprintf(
-							"Welcome back <@%s>!",
-							targetID,
-						),
+						Content: "Something went wrong while removing a role",
 					},
 				})
+				fmt.Println(err)
+				return
+			}
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: fmt.Sprintf(
+						"Welcome back <@%s>!",
+						targetID,
+					),
+				},
 			})
+			fmt.Printf("/unskronk'd <@%s>\n", targetID)
 		},
 	}
 )
@@ -178,6 +219,9 @@ func init() {
 			log.Printf("Skronk role found. Skronk role ID is %s\nWRITE THAT DOWN!", *SkronkID)
 		}
 	}
+
+	skronkTotalDuration.data = make(map[string]int64)
+	skronkInProgress.flags = make(map[string]bool)
 
 	s.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if h, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
