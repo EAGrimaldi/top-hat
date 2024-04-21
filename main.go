@@ -54,6 +54,12 @@ var (
 					MaxValue:    60.0 * 60.0 * 24.0 * 7.0,
 					Required:    false,
 				},
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "reason",
+					Description: "What did they do to deserve this?",
+					Required:    false,
+				},
 			},
 		},
 	}
@@ -93,24 +99,41 @@ var (
 
 			margs := make([]interface{}, 0, len(options))
 			msgformat := ""
-			targetID := ""
-			var duration int64 = int64(durationMinValue)
 
+			targetID := ""
 			if opt, ok := optionMap["target"]; ok {
 				targetID = opt.UserValue(nil).ID
 				if targetID == s.State.User.ID {
 					targetID = i.Member.User.ID
 					msgformat += "Skronk me? Skronk ME!? Skronk YOURSELF!!!\n"
 				}
+				margs = append(margs, targetID)
+				msgformat += "Get skronk'd <@%s>!\n"
+			} else {
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: "Something went wrong; required target option was not provided",
+					},
+				})
+				return
 			}
-			margs = append(margs, targetID)
-			msgformat += "Get skronk'd <@%s>\n"
 
+			duration := int64(durationMinValue)
 			if opt, ok := optionMap["duration"]; ok {
 				duration = opt.IntValue()
 			}
 			margs = append(margs, duration)
 			msgformat += "See you in %d seconds!\n"
+
+			reason := "None"
+			if opt, ok := optionMap["reason"]; ok {
+				if targetID != s.State.User.ID {
+					reason = opt.StringValue()
+					margs = append(margs, reason)
+					msgformat += "> %s\n"
+				}
+			}
 
 			// add skronk role to target
 			err := s.GuildMemberRoleAdd(*GuildID, targetID, *SkronkID)
@@ -121,7 +144,7 @@ var (
 						Content: "Something went wrong while adding a role",
 					},
 				})
-				fmt.Println(err)
+				log.Println(err)
 				return
 			}
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -137,8 +160,13 @@ var (
 			// track total duration in shared resource
 			skronkTotalDuration.mu.Lock()
 			skronkTotalDuration.data[targetID] += duration
-			fmt.Printf("/skronk'd <@%s> for %d seconds\n", targetID, duration)
-			fmt.Printf("\t(%d seconds total this instance)\n", skronkTotalDuration.data[targetID])
+			log.Printf(
+				"/skronk'd <@%s>\n\t Duration: %d seconds\n\t Reason: %s\n\t Total Duration this instance: %d seconds\n",
+				targetID,
+				duration,
+				reason,
+				skronkTotalDuration.data[targetID],
+			)
 			skronkTotalDuration.mu.Unlock()
 
 			// only one goroutine handles timing per user
@@ -175,7 +203,7 @@ var (
 						Content: "Something went wrong while removing a role",
 					},
 				})
-				fmt.Println(err)
+				log.Println(err)
 				return
 			}
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -187,7 +215,7 @@ var (
 					),
 				},
 			})
-			fmt.Printf("/unskronk'd <@%s>\n", targetID)
+			log.Printf("/unskronk'd <@%s>\n", targetID)
 		},
 	}
 )
@@ -195,6 +223,7 @@ var (
 func init() {
 	flag.Parse()
 
+	// create a bot session
 	var err error
 	s, err = discordgo.New("Bot " + *BotToken)
 	if err != nil {
@@ -223,6 +252,7 @@ func init() {
 	skronkTotalDuration.data = make(map[string]int64)
 	skronkInProgress.flags = make(map[string]bool)
 
+	// create a handler for each command
 	s.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if h, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
 			h(s, i)
@@ -231,6 +261,7 @@ func init() {
 }
 
 func main() {
+	// open the session
 	s.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
 		log.Printf("Logged in as: %v#%v", s.State.User.Username, s.State.User.Discriminator)
 	})
@@ -239,6 +270,7 @@ func main() {
 		log.Fatalf("Cannot open the session: %v", err)
 	}
 
+	// add commands to server
 	log.Println("Adding commands...")
 	registeredCommands := make([]*discordgo.ApplicationCommand, len(commands))
 	for i, v := range commands {
@@ -251,11 +283,13 @@ func main() {
 
 	defer s.Close()
 
+	// wait until Ctrl+C signal is sent
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 	log.Println("Press Ctrl+C to exit")
 	<-stop
 
+	// remove commands from server before shut down
 	if *RemoveCommands {
 		log.Println("Removing commands...")
 		for _, v := range registeredCommands {
