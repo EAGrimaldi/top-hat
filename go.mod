@@ -1,4 +1,4 @@
-module wheezing-poc
+module top-hat
 
 go 1.22.2
 
